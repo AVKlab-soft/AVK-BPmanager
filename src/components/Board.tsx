@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as RPointerEvent } from "react";
 import type { EdgeData, NodeData, NodeType, WorkspaceDoc } from "../types";
-import { NODE_W, PORT_Y, QUICK_TYPES, TYPE_META } from "../types";
+import { MAX_H, MAX_W, MIN_H, MIN_W, NODE_H, NODE_W, PORT_Y, QUICK_TYPES, TYPE_META } from "../types";
 import { loadDoc, persistDoc, uid, upsertMeta } from "../lib/store";
 import { buildPrompt } from "../lib/prompt";
 import { copyText, downloadMarkdown, fsSupported, pickDirectory, syncToDirectory } from "../lib/fsdir";
@@ -36,10 +36,13 @@ interface Props {
 type Interaction =
   | { mode: "pan"; sx: number; sy: number; cx: number; cy: number }
   | { mode: "node"; id: string; dx: number; dy: number }
+  | { mode: "resize"; id: string; sw: number; sh: number; sx: number; sy: number }
   | { mode: "palette"; type: NodeType; moved: boolean; sx: number; sy: number };
 
 const MIN_Z = 0.35;
 const MAX_Z = 2.5;
+
+const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
 
 function edgePath(x1: number, y1: number, x2: number, y2: number): string {
   const dx = Math.max(44, Math.min(150, Math.abs(x2 - x1) / 2));
@@ -60,12 +63,15 @@ export default function Board({ wsId, initialName, onBack }: Props) {
   const [saveState, setSaveState] = useState<"saved" | "saving">("saved");
   const [dirName, setDirName] = useState<string | null>(null);
   const [flashId, setFlashId] = useState<string | null>(null);
+  const [resizeId, setResizeId] = useState<string | null>(null);
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const ghostElRef = useRef<HTMLDivElement>(null);
   const interRef = useRef<Interaction | null>(null);
   const dirHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
   const suppressQuickRef = useRef(false);
+  /** последняя позиция курсора над доской (client-координаты) — якорь для зума кнопками */
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
 
   const docRef = useRef(doc);
   const camRef = useRef(cam);
@@ -159,6 +165,13 @@ export default function Board({ wsId, initialName, onBack }: Props) {
     const el = wrapRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {
+      // если курсор над текстом ноды и его есть куда крутить — прокручиваем текст, а не доску
+      const ta = (e.target as HTMLElement | null)?.closest("textarea") as HTMLTextAreaElement | null;
+      if (ta && ta.scrollHeight > ta.clientHeight) {
+        const atTop = ta.scrollTop <= 0;
+        const atBottom = ta.scrollTop + ta.clientHeight >= ta.scrollHeight - 1;
+        if ((e.deltaY > 0 && !atBottom) || (e.deltaY < 0 && !atTop)) return;
+      }
       e.preventDefault();
       const r = el.getBoundingClientRect();
       const sx = e.clientX - r.left;
@@ -216,6 +229,16 @@ export default function Board({ wsId, initialName, onBack }: Props) {
             n.id === it.id ? { ...n, x: Math.round(w.x - it.dx), y: Math.round(w.y - it.dy) } : n,
           ),
         }));
+      } else if (it.mode === "resize") {
+        const z = camRef.current.z;
+        const nw = clamp(it.sw + (e.clientX - it.sx) / z, MIN_W, MAX_W);
+        const nh = clamp(it.sh + (e.clientY - it.sy) / z, MIN_H, MAX_H);
+        mutate((d) => ({
+          ...d,
+          nodes: d.nodes.map((n) =>
+            n.id === it.id ? { ...n, w: Math.round(nw), h: Math.round(nh) } : n,
+          ),
+        }));
       } else if (it.mode === "palette") {
         if (!it.moved && Math.hypot(e.clientX - it.sx, e.clientY - it.sy) > 6) it.moved = true;
         const g = ghostElRef.current;
@@ -253,6 +276,7 @@ export default function Board({ wsId, initialName, onBack }: Props) {
       const it = interRef.current;
       interRef.current = null;
       document.body.style.cursor = "";
+      setResizeId(null);
       if (!it) return;
 
       if (it.mode === "palette") {
@@ -275,6 +299,7 @@ export default function Board({ wsId, initialName, onBack }: Props) {
       interRef.current = null;
       setPending(null);
       setGhost(null);
+      setResizeId(null);
       document.body.style.cursor = "";
     };
 
@@ -302,8 +327,8 @@ export default function Board({ wsId, initialName, onBack }: Props) {
     const pad = 90;
     const minX = Math.min(...ns.map((n) => n.x)) - pad;
     const minY = Math.min(...ns.map((n) => n.y)) - pad;
-    const maxX = Math.max(...ns.map((n) => n.x + NODE_W)) + pad;
-    const maxY = Math.max(...ns.map((n) => n.y + 200)) + pad;
+    const maxX = Math.max(...ns.map((n) => n.x + (n.w ?? NODE_W))) + pad;
+    const maxY = Math.max(...ns.map((n) => n.y + (n.h ?? NODE_H))) + pad;
     const z = Math.min(1.15, Math.max(MIN_Z, Math.min(r.width / (maxX - minX), r.height / (maxY - minY))));
     setCam({
       x: (r.width - (maxX - minX) * z) / 2 - minX * z,
@@ -321,8 +346,10 @@ export default function Board({ wsId, initialName, onBack }: Props) {
     const el = wrapRef.current;
     if (!el) return;
     const r = el.getBoundingClientRect();
-    const sx = r.width / 2;
-    const sy = r.height / 2;
+    // якорь — последняя позиция курсора над доской, иначе центр
+    const lp = lastPointerRef.current;
+    const sx = lp ? lp.x - r.left : r.width / 2;
+    const sy = lp ? lp.y - r.top : r.height / 2;
     setCam((c) => {
       const z = Math.min(MAX_Z, Math.max(MIN_Z, c.z * f));
       const wx = (sx - c.x) / c.z;
@@ -367,6 +394,33 @@ export default function Board({ wsId, initialName, onBack }: Props) {
       setPending({ from: id, x: w.x, y: w.y });
     },
     [screenToWorld],
+  );
+
+  const onResizeStart = useCallback((id: string, e: RPointerEvent) => {
+    if (e.button !== 0) return;
+    const n = docRef.current.nodes.find((x) => x.id === id);
+    if (!n) return;
+    setSel({ kind: "node", id });
+    setResizeId(id);
+    interRef.current = {
+      mode: "resize",
+      id,
+      sw: n.w ?? NODE_W,
+      sh: n.h ?? NODE_H,
+      sx: e.clientX,
+      sy: e.clientY,
+    };
+    document.body.style.cursor = "nwse-resize";
+  }, []);
+
+  const onResizeReset = useCallback(
+    (id: string) => {
+      mutate((d) => ({
+        ...d,
+        nodes: d.nodes.map((n) => (n.id === id ? { ...n, w: undefined, h: undefined } : n)),
+      }));
+    },
+    [mutate],
   );
 
   const onInClick = useCallback((id: string, sx: number, sy: number) => {
@@ -530,7 +584,7 @@ export default function Board({ wsId, initialName, onBack }: Props) {
       const a = nodeById.get(e.from);
       const b = nodeById.get(e.to);
       if (!a || !b) return null;
-      return { x1: a.x + NODE_W, y1: a.y + PORT_Y, x2: b.x, y2: b.y + PORT_Y };
+      return { x1: a.x + (a.w ?? NODE_W), y1: a.y + PORT_Y, x2: b.x, y2: b.y + PORT_Y };
     },
     [nodeById],
   );
@@ -610,6 +664,9 @@ export default function Board({ wsId, initialName, onBack }: Props) {
         <div
           ref={wrapRef}
           onPointerDown={onBgPointerDown}
+          onPointerMove={(e) => {
+            lastPointerRef.current = { x: e.clientX, y: e.clientY };
+          }}
           className="relative flex-1 min-w-0 overflow-hidden cursor-grab board-dots"
           style={{
             touchAction: "none",
@@ -668,7 +725,7 @@ export default function Board({ wsId, initialName, onBack }: Props) {
               })}
               {pending && pendingSrc && (
                 <path
-                  d={edgePath(pendingSrc.x + NODE_W, pendingSrc.y + PORT_Y, pending.x, pending.y)}
+                  d={edgePath(pendingSrc.x + (pendingSrc.w ?? NODE_W), pendingSrc.y + PORT_Y, pending.x, pending.y)}
                   stroke={TYPE_META[pendingSrc.type].color}
                   strokeWidth={2}
                   strokeDasharray="6 6"
@@ -686,6 +743,7 @@ export default function Board({ wsId, initialName, onBack }: Props) {
                 node={n}
                 selected={sel?.kind === "node" && sel.id === n.id}
                 flash={flashId === n.id}
+                resizing={resizeId === n.id}
                 onText={onText}
                 onDelete={deleteNode}
                 onCopy={onCopyNode}
@@ -694,6 +752,8 @@ export default function Board({ wsId, initialName, onBack }: Props) {
                 onInClick={onInClick}
                 onAssemble={assemble}
                 onPaste={pasteAnswer}
+                onResizeStart={onResizeStart}
+                onResizeReset={onResizeReset}
               />
             ))}
           </div>

@@ -1,13 +1,14 @@
-import { memo, useEffect, useRef } from "react";
+import { memo } from "react";
 import type { PointerEvent as RPointerEvent } from "react";
 import type { NodeData } from "../types";
-import { NODE_W, PORT_Y, TYPE_META } from "../types";
+import { NODE_H, NODE_W, PORT_Y, TYPE_META } from "../types";
 import { IconClipboard, IconCopy, IconSend, IconX } from "./icons";
 
 interface Props {
   node: NodeData;
   selected: boolean;
   flash: boolean;
+  resizing: boolean;
   onText: (id: string, text: string) => void;
   onDelete: (id: string) => void;
   onCopy: (node: NodeData) => void;
@@ -16,12 +17,15 @@ interface Props {
   onInClick: (id: string, sx: number, sy: number) => void;
   onAssemble: (id: string) => void;
   onPaste: (id: string) => void;
+  onResizeStart: (id: string, e: RPointerEvent) => void;
+  onResizeReset: (id: string) => void;
 }
 
 function NodeCard({
   node,
   selected,
   flash,
+  resizing,
   onText,
   onDelete,
   onCopy,
@@ -30,29 +34,25 @@ function NodeCard({
   onInClick,
   onAssemble,
   onPaste,
+  onResizeStart,
+  onResizeReset,
 }: Props) {
   const meta = TYPE_META[node.type];
-  const taRef = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    const el = taRef.current;
-    if (!el) return;
-    el.style.height = "0px";
-    el.style.height = Math.max(84, el.scrollHeight) + "px";
-  }, [node.text]);
+  const w = node.w ?? NODE_W;
+  const h = node.h ?? NODE_H;
 
   return (
     <div
       data-node={node.id}
       className="absolute group anim-node"
-      style={{ left: node.x, top: node.y, width: NODE_W }}
+      style={{ left: node.x, top: node.y, width: w, height: h }}
     >
       {/* входная точка */}
       <button
         data-port-in={node.id}
         onPointerDown={(e) => e.stopPropagation()}
         onClick={(e) => onInClick(node.id, e.clientX, e.clientY)}
-        className="port-pulse absolute z-20 w-4 h-4 -translate-x-0 rounded-full border-2 bg-abyss transition-transform hover:scale-125 cursor-crosshair"
+        className="port-pulse absolute z-20 w-4 h-4 rounded-full border-2 bg-abyss transition-transform hover:scale-125 cursor-crosshair"
         style={{ left: -8, top: PORT_Y - 8, borderColor: meta.color, color: meta.color }}
         title="Вход: клик — создать ноду рядом · либо протяните связь с выхода другой ноды"
       />
@@ -64,13 +64,14 @@ function NodeCard({
           onOutDown(node.id, e);
         }}
         className="port-pulse absolute z-20 w-4 h-4 rounded-full border-2 bg-abyss transition-transform hover:scale-125 cursor-crosshair"
-        style={{ left: NODE_W - 8, top: PORT_Y - 8, borderColor: meta.color, color: meta.color }}
+        style={{ left: w - 8, top: PORT_Y - 8, borderColor: meta.color, color: meta.color }}
         title="Выход: потяните к входной точке другой ноды"
       />
 
+      {/* карточка */}
       <div
         onPointerDown={(e) => onNodePointerDown(node.id, e)}
-        className={`rounded-lg border bg-panel overflow-visible cursor-grab active:cursor-grabbing transition-shadow ${
+        className={`h-full flex flex-col rounded-lg border bg-panel overflow-hidden cursor-grab active:cursor-grabbing transition-shadow ${
           flash ? "flash-ring" : ""
         }`}
         style={{
@@ -82,7 +83,10 @@ function NodeCard({
         }}
       >
         {/* шапка */}
-        <div className="flex items-center gap-2 pl-3 pr-2 border-b border-line/60" style={{ height: PORT_Y }}>
+        <div
+          className="shrink-0 flex items-center gap-2 pl-3 pr-2 border-b border-line/60"
+          style={{ height: PORT_Y }}
+        >
           <span
             className="w-7 h-7 shrink-0 rounded-md grid place-items-center"
             style={{ background: `${meta.color}1c`, color: meta.color }}
@@ -118,7 +122,7 @@ function NodeCard({
             )}
           </span>
           <span
-            className="font-display font-medium text-[9.5px] tracking-[0.14em] uppercase leading-none"
+            className="font-display font-medium text-[9.5px] tracking-[0.14em] uppercase leading-none truncate"
             style={{ color: meta.color }}
           >
             {meta.label}
@@ -133,22 +137,19 @@ function NodeCard({
           </button>
         </div>
 
-        {/* текст */}
+        {/* текст — прокручивается внутри ноды */}
         <textarea
-          ref={taRef}
           value={node.text}
           onChange={(e) => onText(node.id, e.target.value)}
           onPointerDown={(e) => e.stopPropagation()}
           placeholder={meta.placeholder}
           spellCheck={false}
-          className="block w-full bg-transparent resize-none outline-none text-[13px] leading-relaxed px-3 pt-2.5 pb-2 text-fg placeholder:text-dim/70 select-text"
+          className="flex-1 min-h-0 w-full bg-transparent resize-none outline-none overflow-y-auto text-[13px] leading-relaxed px-3 py-2.5 text-fg placeholder:text-dim/70 select-text"
         />
 
         {/* подвал */}
-        <div className="flex items-center gap-1.5 border-t border-line/60 px-3 py-2">
-          <span className="font-mono text-[10px] text-dim tabular-nums">
-            {node.text.length} симв.
-          </span>
+        <div className="shrink-0 flex items-center gap-1.5 border-t border-line/60 px-3 py-2">
+          <span className="font-mono text-[10px] text-dim tabular-nums">{node.text.length} симв.</span>
           <span className="ml-auto flex items-center gap-1.5">
             <button
               onPointerDown={(e) => e.stopPropagation()}
@@ -183,6 +184,34 @@ function NodeCard({
           </span>
         </div>
       </div>
+
+      {/* уголок изменения размера */}
+      <div
+        data-resize={node.id}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          onResizeStart(node.id, e);
+        }}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          onResizeReset(node.id);
+        }}
+        className="absolute z-20 w-[18px] h-[18px] grid place-items-center rounded cursor-nwse-resize text-dim transition-colors"
+        style={{ right: -2, bottom: -2, color: resizing ? meta.color : undefined }}
+        title="Потянуть — изменить размер · двойной клик — стандартный размер"
+      >
+        <svg viewBox="0 0 14 14" className="w-[13px] h-[13px]" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
+          <path d="M12.5 5l-7.5 7.5" />
+          <path d="M12.5 9.5L9 13" />
+        </svg>
+      </div>
+
+      {/* индикатор размера при изменении */}
+      {resizing && (
+        <div className="absolute -top-7 right-0 z-30 font-mono text-[10px] text-fg bg-panel2 border border-line2 rounded px-1.5 py-0.5 pointer-events-none tabular-nums anim-pop">
+          {w}×{h}
+        </div>
+      )}
     </div>
   );
 }

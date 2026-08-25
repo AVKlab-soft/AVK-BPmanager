@@ -6,6 +6,10 @@ export interface NodeData {
   x: number;
   y: number;
   text: string;
+  /** ширина ноды (мировые px), undefined = стандартная */
+  w?: number;
+  /** высота ноды (мировые px), undefined = стандартная */
+  h?: number;
 }
 
 export interface EdgeData {
@@ -37,10 +41,17 @@ export interface TypeMeta {
   hint: string;
 }
 
-/** ширина ноды в мировых координатах */
+/** ширина ноды по умолчанию (мировые px) */
 export const NODE_W = 288;
+/** высота ноды по умолчанию (мировые px) */
+export const NODE_H = 216;
 /** высота, на которой расположены порты (от верха ноды) */
 export const PORT_Y = 52;
+/** пределы изменения размера ноды */
+export const MIN_W = 216;
+export const MAX_W = 640;
+export const MIN_H = 150;
+export const MAX_H = 780;
 
 export const TYPE_META: Record<NodeType, TypeMeta> = {
   question: {
