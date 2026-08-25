@@ -460,6 +460,10 @@ export default function Board({ wsId, initialName, onBack }: Props) {
 
   const pasteAnswer = useCallback(
     (id: string) => {
+      if (typeof navigator === "undefined" || !navigator.clipboard?.readText) {
+        toast("err", "Браузер не даёт читать буфер — вставьте ответ вручную (Cmd+V)");
+        return;
+      }
       navigator.clipboard
         .readText()
         .then((t) => {
@@ -470,7 +474,7 @@ export default function Board({ wsId, initialName, onBack }: Props) {
           mutate((d) => ({ ...d, nodes: d.nodes.map((n) => (n.id === id ? { ...n, text: t } : n)) }));
           toast("ok", "Ответ вставлен в ноду");
         })
-        .catch(() => toast("err", "Браузер не дал доступ к буферу — вставьте вручную (Ctrl+V)"));
+        .catch(() => toast("err", "Браузер не дал доступ к буферу — вставьте вручную (Cmd/Ctrl+V)"));
     },
     [mutate, toast],
   );
