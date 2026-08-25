@@ -1,6 +1,5 @@
 import type { WorkspaceDoc } from "../types";
-import { TYPE_META } from "../types";
-import { docToMarkdown, nodeToMarkdown } from "./prompt";
+import { docToMarkdown } from "./prompt";
 import { slugify } from "./store";
 
 export function fsSupported(): boolean {
@@ -17,46 +16,6 @@ export async function pickDirectory(): Promise<{ handle: FileSystemDirectoryHand
   } catch {
     return null; // пользователь отменил или API недоступен
   }
-}
-
-function firstWords(s: string): string {
-  return slugify(s.trim().split(/\s+/).slice(0, 3).join("-")).slice(0, 24);
-}
-
-/**
- * Записывает доску в подпапку рабочей директории:
- * 00-index.md + по файлу на каждую ноду. Устаревшие .md удаляются.
- */
-export async function syncToDirectory(root: FileSystemDirectoryHandle, doc: WorkspaceDoc): Promise<number> {
-  const dir = await root.getDirectoryHandle(slugify(doc.name), { create: true });
-
-  const want = new Map<string, string>();
-  want.set("00-index.md", docToMarkdown(doc));
-  doc.nodes.forEach((n, i) => {
-    const num = String(i + 1).padStart(2, "0");
-    const name = `${num}-${TYPE_META[n.type].file}-${firstWords(n.text) || n.id.slice(0, 6)}.md`;
-    want.set(name, nodeToMarkdown(n, doc.name));
-  });
-
-  // чистим устаревшее
-  const entries = (dir as unknown as { entries(): AsyncIterable<[string, { kind: string }]> }).entries();
-  for await (const [name, handle] of entries) {
-    if (handle.kind === "file" && name.endsWith(".md") && !want.has(name)) {
-      try {
-        await dir.removeEntry(name);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  for (const [name, content] of want) {
-    const fh = await dir.getFileHandle(name, { create: true });
-    const writable = await (fh as unknown as { createWritable(): Promise<{ write(s: string): Promise<void>; close(): Promise<void> }> }).createWritable();
-    await writable.write(content);
-    await writable.close();
-  }
-  return want.size;
 }
 
 /** Скачивание сводного .md (фолбэк для браузеров без File System Access). */

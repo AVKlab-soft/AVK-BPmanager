@@ -2,9 +2,11 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { PointerEvent as RPointerEvent } from "react";
 import type { EdgeData, NodeData, NodeType, WorkspaceDoc } from "../types";
 import { MAX_H, MAX_W, MIN_H, MIN_W, NODE_H, NODE_W, PORT_Y, QUICK_TYPES, TYPE_META } from "../types";
-import { loadDoc, persistDoc, uid, upsertMeta } from "../lib/store";
+import { uid } from "../lib/store";
 import { buildPrompt } from "../lib/prompt";
-import { copyText, downloadMarkdown, fsSupported, pickDirectory, syncToDirectory } from "../lib/fsdir";
+import { copyText, downloadMarkdown } from "../lib/fsdir";
+import type { Backend } from "../lib/storage";
+import { loadProject, saveProject } from "../lib/storage";
 import { useToast } from "./Toasts";
 import NodeCard from "./NodeCard";
 import Palette from "./Palette";
@@ -28,8 +30,10 @@ interface Cam {
 }
 
 interface Props {
-  wsId: string;
+  backend: Backend;
+  folder: string;
   initialName: string;
+  storageLabel: string;
   onBack: () => void;
 }
 
@@ -49,27 +53,31 @@ function edgePath(x1: number, y1: number, x2: number, y2: number): string {
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
 }
 
-export default function Board({ wsId, initialName, onBack }: Props) {
+export default function Board({ backend, folder, initialName, storageLabel, onBack }: Props) {
   const toast = useToast();
 
-  const [doc, setDoc] = useState<WorkspaceDoc>(
-    () => loadDoc(wsId) ?? { name: initialName, nodes: [], edges: [], updatedAt: Date.now() },
-  );
+  const [doc, setDoc] = useState<WorkspaceDoc>(() => ({
+    name: initialName,
+    nodes: [],
+    edges: [],
+    updatedAt: Date.now(),
+  }));
   const [cam, setCam] = useState<Cam>({ x: 140, y: 110, z: 1 });
   const [sel, setSel] = useState<{ kind: "node" | "edge"; id: string } | null>(null);
   const [pending, setPending] = useState<{ from: string; x: number; y: number } | null>(null);
   const [quick, setQuick] = useState<{ nodeId: string; sx: number; sy: number } | null>(null);
   const [ghost, setGhost] = useState<{ type: NodeType } | null>(null);
-  const [saveState, setSaveState] = useState<"saved" | "saving">("saved");
-  const [dirName, setDirName] = useState<string | null>(null);
+  const [saveState, setSaveState] = useState<"saved" | "saving" | "error">("saved");
   const [flashId, setFlashId] = useState<string | null>(null);
   const [resizeId, setResizeId] = useState<string | null>(null);
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const ghostElRef = useRef<HTMLDivElement>(null);
   const interRef = useRef<Interaction | null>(null);
-  const dirHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
   const suppressQuickRef = useRef(false);
+  const loadedRef = useRef(false);
+  const backendRef = useRef(backend);
+  backendRef.current = backend;
   /** последняя позиция курсора над доской (client-координаты) — якорь для зума кнопками */
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
 
@@ -139,25 +147,37 @@ export default function Board({ wsId, initialName, onBack }: Props) {
     [mutate],
   );
 
-  /* ---------- автосохранение + .md ---------- */
+  /* ---------- загрузка с диска ---------- */
 
   useEffect(() => {
+    let alive = true;
+    loadProject(backend, folder)
+      .then((d) => {
+        if (!alive) return;
+        setDoc({ ...d, name: d.name || initialName });
+        loadedRef.current = true;
+      })
+      .catch(() => {
+        if (alive) toast("err", "Не удалось открыть проект с диска");
+      });
+    return () => {
+      alive = false;
+    };
+  }, [backend, folder, initialName, toast]);
+
+  /* ---------- автосохранение на диск (json + .md) ---------- */
+
+  useEffect(() => {
+    if (!loadedRef.current) return;
     setSaveState("saving");
     const t = window.setTimeout(() => {
-      persistDoc(wsId, docRef.current);
-      upsertMeta({
-        id: wsId,
-        name: docRef.current.name,
-        updatedAt: docRef.current.updatedAt,
-        nodeCount: docRef.current.nodes.length,
-      });
-      setSaveState("saved");
-      if (dirHandleRef.current) {
-        syncToDirectory(dirHandleRef.current, docRef.current).catch(() => undefined);
-      }
+      const d = { ...docRef.current, updatedAt: Date.now() };
+      saveProject(backendRef.current, folder, d)
+        .then(() => setSaveState("saved"))
+        .catch(() => setSaveState("error"));
     }, 650);
     return () => window.clearTimeout(t);
-  }, [doc, wsId]);
+  }, [doc, folder]);
 
   /* ---------- зум колесом ---------- */
 
@@ -551,24 +571,7 @@ export default function Board({ wsId, initialName, onBack }: Props) {
     }
   }, [ghost]);
 
-  /* ---------- папка с .md ---------- */
-
-  const connectDir = useCallback(async () => {
-    if (!fsSupported()) {
-      toast("info", "Этот браузер не даёт доступ к папкам. Данные в localStorage, экспорт — кнопкой «Экспорт .md».");
-      return;
-    }
-    const r = await pickDirectory();
-    if (!r) return;
-    dirHandleRef.current = r.handle;
-    setDirName(r.name);
-    try {
-      const count = await syncToDirectory(r.handle, docRef.current);
-      toast("ok", `Папка «${r.name}»: записано ${count} .md-файлов`);
-    } catch {
-      toast("err", "Не удалось записать .md — проверьте права на папку");
-    }
-  }, [toast]);
+  /* ---------- экспорт ---------- */
 
   const exportMd = useCallback(() => {
     downloadMarkdown(docRef.current);
@@ -624,30 +627,27 @@ export default function Board({ wsId, initialName, onBack }: Props) {
           title="Название пространства"
         />
 
-        <span className="inline-flex items-center gap-1.5 font-mono text-[10px] text-dim">
+        <span
+          className={`inline-flex items-center gap-1.5 font-mono text-[10px] ${
+            saveState === "error" ? "text-ans" : "text-dim"
+          }`}
+        >
           <span
-            className={`w-1.5 h-1.5 rounded-full ${saveState === "saving" ? "bg-q blink-soft" : "bg-ctx"}`}
+            className={`w-1.5 h-1.5 rounded-full ${
+              saveState === "saving" ? "bg-q blink-soft" : saveState === "error" ? "bg-ans" : "bg-ctx"
+            }`}
           />
-          {saveState === "saving" ? "сохранение…" : "сохранено"}
+          {saveState === "saving" ? "сохранение…" : saveState === "error" ? "ошибка записи" : "сохранено"}
         </span>
 
         <span className="ml-auto flex items-center gap-2">
-          <button
-            onClick={() => void connectDir()}
-            className={`inline-flex items-center gap-1.5 text-[12px] font-medium border rounded-md px-2.5 py-1.5 transition max-w-[220px] ${
-              dirName
-                ? "text-ctx border-ctx/40 hover:bg-ctx/10"
-                : "text-mut border-line hover:text-fg hover:border-line2"
-            }`}
-            title="Записывать .md-файлы доски в выбранную папку на диске"
+          <span
+            className="hidden md:inline-flex items-center gap-1.5 text-[11px] font-mono text-ctx border border-ctx/30 bg-ctx/5 rounded-md px-2.5 py-1.5 max-w-[280px]"
+            title={`Все изменения пишутся на диск: ${storageLabel}`}
           >
-            <IconFolder className="w-4 h-4 shrink-0" />
-            {dirName ? (
-              <span className="truncate">{dirName}</span>
-            ) : (
-              <span className="hidden md:inline">Подключить папку</span>
-            )}
-          </button>
+            <IconFolder className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">{storageLabel}</span>
+          </span>
           <button
             onClick={exportMd}
             className="inline-flex items-center gap-1.5 text-[12px] font-medium text-mut border border-line rounded-md px-2.5 py-1.5 hover:text-fg hover:border-line2 transition"

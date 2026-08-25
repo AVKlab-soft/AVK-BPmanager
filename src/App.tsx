@@ -1,102 +1,139 @@
-import { Component, useCallback, useState } from "react";
-import type { ErrorInfo, ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { WorkspaceMeta } from "./types";
-import { deleteWorkspace, loadMetas, persistDoc, seedIfEmpty, uid, upsertMeta } from "./lib/store";
 import { ToastProvider, useToast } from "./components/Toasts";
 import EntryScreen from "./components/EntryScreen";
 import Board from "./components/Board";
-import { LogoMark } from "./components/icons";
+import type { Backend } from "./lib/storage";
+import {
+  backendLabel,
+  connectFolderBackend,
+  createProject,
+  deleteProject,
+  detectBackend,
+  listProjects,
+} from "./lib/storage";
+
+type Stage =
+  | { s: "detecting" }
+  | { s: "need-folder" }
+  | { s: "none" }
+  | { s: "ready"; backend: Backend };
 
 function Shell() {
-  const [metas, setMetas] = useState<WorkspaceMeta[]>(() => seedIfEmpty());
-  const [openId, setOpenId] = useState<string | null>(null);
+  const [stage, setStage] = useState<Stage>({ s: "detecting" });
+  const [projects, setProjects] = useState<WorkspaceMeta[]>([]);
+  const [loadingList, setLoadingList] = useState(false);
+  const [openFolder, setOpenFolder] = useState<string | null>(null);
   const toast = useToast();
+  const stageRef = useRef(stage);
+  stageRef.current = stage;
+
+  const refresh = useCallback(
+    async (b: Backend) => {
+      setLoadingList(true);
+      try {
+        setProjects(await listProjects(b));
+      } catch {
+        toast("err", "Не удалось прочитать список проектов");
+      } finally {
+        setLoadingList(false);
+      }
+    },
+    [toast],
+  );
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const b = await detectBackend();
+      if (!alive) return;
+      if (b === "none") return setStage({ s: "none" });
+      if (b === "need-folder") return setStage({ s: "need-folder" });
+      setStage({ s: "ready", backend: b });
+      void refresh(b);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [refresh]);
+
+  const connectFolder = useCallback(async () => {
+    const b = await connectFolderBackend();
+    if (!b || b.kind !== "fs") return;
+    setStage({ s: "ready", backend: b });
+    toast("ok", `Папка «${b.root.name}» подключена — данные будут в подпапке data`);
+    void refresh(b);
+  }, [refresh, toast]);
 
   const create = useCallback(
-    (name: string) => {
-      const id = uid();
-      persistDoc(id, { name, nodes: [], edges: [], updatedAt: Date.now() });
-      upsertMeta({ id, name, updatedAt: Date.now(), nodeCount: 0 });
-      setMetas(loadMetas());
-      setOpenId(id);
-      toast("ok", `Пространство «${name}» создано`);
+    async (name: string) => {
+      const st = stageRef.current;
+      if (st.s !== "ready") return;
+      try {
+        const { folder } = await createProject(st.backend, name);
+        toast("ok", `Проект «${name}» создан на диске`);
+        setOpenFolder(folder);
+      } catch {
+        toast("err", "Не удалось создать проект — проверьте доступ к папке");
+      }
     },
     [toast],
   );
 
   const remove = useCallback(
-    (id: string) => {
-      deleteWorkspace(id);
-      setMetas(loadMetas());
-      toast("info", "Пространство удалено");
+    async (folder: string) => {
+      const st = stageRef.current;
+      if (st.s !== "ready") return;
+      try {
+        await deleteProject(st.backend, folder);
+        toast("info", "Проект удалён с диска");
+      } catch {
+        toast("err", "Не удалось удалить проект");
+      }
+      void refresh(st.backend);
     },
-    [toast],
+    [refresh, toast],
   );
 
   const back = useCallback(() => {
-    setMetas(loadMetas());
-    setOpenId(null);
-  }, []);
+    setOpenFolder(null);
+    const st = stageRef.current;
+    if (st.s === "ready") void refresh(st.backend);
+  }, [refresh]);
 
-  const open = metas.find((m) => m.id === openId) ?? null;
+  const openProject = openFolder ? (projects.find((p) => p.id === openFolder) ?? null) : null;
 
-  if (open) {
-    return <Board key={open.id} wsId={open.id} initialName={open.name} onBack={back} />;
-  }
-  return <EntryScreen metas={metas} onOpen={setOpenId} onCreate={create} onDelete={remove} />;
-}
-
-/** Чтобы ошибка в рантайме показывалась сообщением, а не белым экраном. */
-class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
-  state = { error: null as Error | null };
-
-  static getDerivedStateFromError(error: Error) {
-    return { error };
-  }
-
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("Узел: ошибка интерфейса", error, info);
+  if (stage.s === "ready" && openFolder) {
+    return (
+      <Board
+        key={openFolder}
+        backend={stage.backend}
+        folder={openFolder}
+        initialName={openProject?.name ?? openFolder}
+        storageLabel={backendLabel(stage.backend)}
+        onBack={back}
+      />
+    );
   }
 
-  render() {
-    if (this.state.error) {
-      return (
-        <div className="min-h-screen bg-abyss text-fg flex items-center justify-center p-6">
-          <div className="max-w-md w-full border border-line bg-panel rounded-lg p-7 anim-pop">
-            <div className="flex items-center gap-3">
-              <LogoMark className="w-9 h-9" />
-              <div>
-                <div className="font-display font-bold text-lg leading-tight">Что-то развязалось</div>
-                <div className="font-mono text-[11px] text-dim">внутренняя ошибка «Узла»</div>
-              </div>
-            </div>
-            <pre className="mt-5 text-[11.5px] leading-relaxed text-mut bg-deep border border-line rounded-md p-3.5 overflow-x-auto whitespace-pre-wrap">
-              {String(this.state.error?.message ?? this.state.error)}
-            </pre>
-            <p className="mt-4 text-[12.5px] text-dim leading-relaxed">
-              Данные досок хранятся в localStorage браузера и не пострадали. Перезагрузите страницу — если ошибка
-              повторяется, откройте приложение в другом браузере и напишите, что вывела эта плашка.
-            </p>
-            <button
-              onClick={() => window.location.reload()}
-              className="mt-5 w-full bg-q text-[#241a02] font-semibold text-[13px] rounded-md px-4 py-2.5 hover:brightness-110 active:scale-[0.98] transition"
-            >
-              Перезагрузить страницу
-            </button>
-          </div>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
+  return (
+    <EntryScreen
+      mode={stage.s === "ready" ? "ready" : stage.s}
+      backendInfo={stage.s === "ready" ? backendLabel(stage.backend) : null}
+      projects={projects}
+      loading={loadingList}
+      onConnect={() => void connectFolder()}
+      onOpen={setOpenFolder}
+      onCreate={(n) => void create(n)}
+      onDelete={(f) => void remove(f)}
+    />
+  );
 }
 
 export default function App() {
   return (
-    <ErrorBoundary>
-      <ToastProvider>
-        <Shell />
-      </ToastProvider>
-    </ErrorBoundary>
+    <ToastProvider>
+      <Shell />
+    </ToastProvider>
   );
 }
